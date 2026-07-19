@@ -1,0 +1,16 @@
+# Binaries
+/ztime
+/dist/
+*.exe
+*.test
+*.out
+
+# Go
+/vendor/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

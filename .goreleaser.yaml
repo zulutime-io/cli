@@ -1,0 +1,56 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+project_name: ztime
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: ztime
+    main: ./cmd/ztime
+    binary: ztime
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X github.com/zulutime-io/cli/internal/version.Version={{.Version}}
+
+archives:
+  - formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- .Arch }}
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+
+brews:
+  - repository:
+      owner: zulutime-io
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: "https://zulutime.io/docs/cli"
+    description: "ZuluTime developer CLI — book hours from the terminal"
+    license: MIT
+    test: |
+      assert_match version.to_s, shell_output("#{bin}/ztime version")
+    install: |
+      bin.install "ztime"
