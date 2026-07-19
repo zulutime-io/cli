@@ -8,7 +8,8 @@ import (
 )
 
 const (
-	DefaultAPIURL = "https://zulutime.io/api/v1"
+	// Origin only — client paths already include /api/v1/...
+	DefaultAPIURL = "https://zulutime.io"
 	dirName       = "ztime"
 	fileName      = "config.json"
 	credFileName  = "credentials.json"

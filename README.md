@@ -33,7 +33,7 @@ ztime book      # interactive: client → project → hours (+ git commits)
 ztime submit    # submit today's drafts
 ```
 
-Default API: `https://zulutime.io/api/v1`. Override with `ZTIME_API_URL` or `api_url` in config.
+Default API origin: `https://zulutime.io` (paths use `/api/v1/...`). Override with `ZTIME_API_URL` or `api_url` in config.
 
 ## Commands
 

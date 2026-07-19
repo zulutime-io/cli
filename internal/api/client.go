@@ -29,13 +29,20 @@ type Client struct {
 
 func New(cfg *config.Config, creds *config.Credentials, onUpdate func(*config.Credentials) error) *Client {
 	return &Client{
-		BaseURL: strings.TrimRight(cfg.APIURL, "/"),
+		BaseURL: normalizeBaseURL(cfg.APIURL),
 		HTTP: &http.Client{
 			Timeout: 30 * time.Second,
 		},
 		creds:    creds,
 		onUpdate: onUpdate,
 	}
+}
+
+// normalizeBaseURL keeps the API origin. Paths already start with /api/v1/.
+func normalizeBaseURL(raw string) string {
+	base := strings.TrimRight(strings.TrimSpace(raw), "/")
+	base = strings.TrimSuffix(base, "/api/v1")
+	return strings.TrimRight(base, "/")
 }
 
 type APIError struct {
