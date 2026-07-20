@@ -29,7 +29,14 @@ func RequireAuth(client *api.Client) error {
 		return nil
 	}
 	if errors.Is(err, api.ErrUnauthorized) {
+		if client != nil && client.BaseURL != "" {
+			return fmt.Errorf("not logged in (token rejected by %s) — run `ztime login` again (device key / API URL)", client.BaseURL)
+		}
 		return fmt.Errorf("not logged in — run `ztime login` first")
+	}
+	var ae *api.APIError
+	if errors.As(err, &ae) && ae.Status == 401 {
+		return fmt.Errorf("not logged in (%s) — run `ztime login` again", ae.Message)
 	}
 	return err
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/zulutime-io/cli/internal/config"
+	"github.com/zulutime-io/cli/internal/devicekey"
 	"github.com/zulutime-io/cli/internal/version"
 )
 
@@ -74,10 +75,28 @@ type Organization struct {
 	Name string `json:"name"`
 }
 
+type Entitlements struct {
+	Plan           string `json:"plan"`
+	Status         string `json:"status"`
+	Approvals      bool   `json:"approvals"`
+	ClientInvoices bool   `json:"client_invoices"`
+	ClientRequests bool   `json:"client_requests"`
+	Integrations   bool   `json:"integrations"`
+}
+
+// MsgRequestsLocked is shown when client_requests is off (free / locked Team).
+const MsgRequestsLocked = "Verzoeken zit in Team — upgrade op zulutime.io"
+
 type MeResponse struct {
-	User         User         `json:"user"`
-	Organization Organization `json:"organization"`
-	Role         string       `json:"role"`
+	User         User          `json:"user"`
+	Organization Organization  `json:"organization"`
+	Role         string        `json:"role"`
+	Timezone     string        `json:"timezone"`
+	Entitlements *Entitlements `json:"entitlements"`
+}
+
+func (m *MeResponse) HasClientRequests() bool {
+	return m != nil && m.Entitlements != nil && m.Entitlements.ClientRequests
 }
 
 type ClientRow struct {
@@ -102,12 +121,24 @@ type TimeEntry struct {
 	ProjectID       string      `json:"project_id"`
 	ProjectName     string      `json:"project_name"`
 	ClientName      string      `json:"client_name"`
+	UserName        string      `json:"user_name,omitempty"`
 	EntryDate       string      `json:"entry_date"`
 	DurationMinutes int         `json:"duration_minutes"`
 	Description     string      `json:"description"`
 	Billable        bool        `json:"billable"`
 	Status          string      `json:"status"`
+	RequestID       *string     `json:"request_id,omitempty"`
 	SourceMeta      *SourceMeta `json:"source_meta,omitempty"`
+	CreatedAt       string      `json:"created_at,omitempty"`
+	SubmittedAt     *string     `json:"submitted_at,omitempty"`
+}
+
+type ActivityEvent struct {
+	ID        string          `json:"id"`
+	EventType string          `json:"event_type"`
+	ActorName string          `json:"actor_name,omitempty"`
+	Payload   json.RawMessage `json:"payload"`
+	CreatedAt string          `json:"created_at"`
 }
 
 type SourceMeta struct {
@@ -121,6 +152,7 @@ type SourceMeta struct {
 
 type CreateTimeEntryInput struct {
 	ProjectID     string      `json:"project_id"`
+	RequestID     string      `json:"request_id,omitempty"`
 	EntryDate     string      `json:"entry_date"`
 	DurationHours float64     `json:"duration_hours"`
 	Description   string      `json:"description"`
@@ -135,15 +167,41 @@ func (c *Client) SetCredentials(creds *config.Credentials) {
 	c.creds = creds
 }
 
-func (c *Client) Login(email, password string) (*TokenResponse, error) {
-	var out TokenResponse
-	err := c.do(http.MethodPost, "/api/v1/auth/login", map[string]any{
-		"email": email, "password": password, "remember_me": true,
+type CLILoginStartResponse struct {
+	LoginID   string `json:"login_id"`
+	ExpiresIn int    `json:"expires_in"`
+}
+
+type CLITokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	DeviceID    string `json:"device_id"`
+	ExpiresIn   int    `json:"expires_in"`
+}
+
+func (c *Client) StartCLILogin(body map[string]any) (*CLILoginStartResponse, error) {
+	var out CLILoginStartResponse
+	if err := c.do(http.MethodPost, "/api/v1/cli/login/start", body, false, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) ExchangeCLICode(code, verifier, redirectURI, devicePrivateKey, deviceKeyAlg string) (*CLITokenResponse, error) {
+	var out CLITokenResponse
+	err := c.do(http.MethodPost, "/api/v1/cli/token", map[string]any{
+		"code": code, "code_verifier": verifier, "redirect_uri": redirectURI,
 	}, false, &out)
 	if err != nil {
 		return nil, err
 	}
-	creds := &config.Credentials{AccessToken: out.AccessToken, RefreshToken: out.RefreshToken}
+	creds := &config.Credentials{
+		AccessToken:      out.AccessToken,
+		TokenType:        "pat",
+		DeviceID:         out.DeviceID,
+		DevicePrivateKey: devicePrivateKey,
+		DeviceKeyAlg:     deviceKeyAlg,
+	}
 	c.SetCredentials(creds)
 	if c.onUpdate != nil {
 		_ = c.onUpdate(creds)
@@ -153,6 +211,10 @@ func (c *Client) Login(email, password string) (*TokenResponse, error) {
 
 func (c *Client) Refresh() error {
 	c.mu.Lock()
+	if c.creds != nil && c.creds.IsPAT() {
+		c.mu.Unlock()
+		return ErrUnauthorized
+	}
 	rt := ""
 	if c.creds != nil {
 		rt = c.creds.RefreshToken
@@ -178,12 +240,18 @@ func (c *Client) Refresh() error {
 
 func (c *Client) Logout() error {
 	c.mu.Lock()
+	deviceID := ""
 	rt := ""
+	isPAT := false
 	if c.creds != nil {
+		deviceID = c.creds.DeviceID
 		rt = c.creds.RefreshToken
+		isPAT = c.creds.IsPAT()
 	}
 	c.mu.Unlock()
-	if rt != "" {
+	if isPAT && deviceID != "" {
+		_ = c.doAuthed(http.MethodDelete, "/api/v1/account/devices/"+deviceID, nil, nil)
+	} else if rt != "" {
 		_ = c.do(http.MethodPost, "/api/v1/auth/logout", map[string]any{
 			"refresh_token": rt,
 		}, false, nil)
@@ -218,6 +286,116 @@ func (c *Client) ListProjects() ([]Project, error) {
 	}
 	if out == nil {
 		out = []Project{}
+	}
+	return out, nil
+}
+
+type ClientRequest struct {
+	ID            string            `json:"id"`
+	Ref           string            `json:"ref"`
+	ClientID      string            `json:"client_id"`
+	ClientName    string            `json:"client_name,omitempty"`
+	ProjectID     *string           `json:"project_id,omitempty"`
+	ProjectName   string            `json:"project_name,omitempty"`
+	TypeID        string            `json:"type_id"`
+	TypeName      string            `json:"type_name,omitempty"`
+	Title         string            `json:"title"`
+	Description   string            `json:"description"`
+	Status        string            `json:"status"`
+	CreatedByName string            `json:"created_by_name,omitempty"`
+	Assignees     []RequestAssignee `json:"assignees,omitempty"`
+	MinutesLogged int               `json:"minutes_logged,omitempty"`
+	CreatedAt     string            `json:"created_at"`
+}
+
+type RequestAssignee struct {
+	UserID    string `json:"user_id"`
+	UserName  string `json:"user_name,omitempty"`
+	UserEmail string `json:"user_email,omitempty"`
+}
+
+func (c *Client) ListRequests(clientID, status string) ([]ClientRequest, error) {
+	q := url.Values{}
+	if clientID != "" {
+		q.Set("client_id", clientID)
+	}
+	if status != "" {
+		q.Set("status", status)
+	}
+	path := "/api/v1/requests"
+	if enc := q.Encode(); enc != "" {
+		path += "?" + enc
+	}
+	var out []ClientRequest
+	if err := c.doAuthed(http.MethodGet, path, nil, &out); err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = []ClientRequest{}
+	}
+	return out, nil
+}
+
+func (c *Client) GetRequest(id string) (*ClientRequest, error) {
+	var out ClientRequest
+	if err := c.doAuthed(http.MethodGet, "/api/v1/requests/"+id, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) ListRequestHours(id string) ([]TimeEntry, error) {
+	var out []TimeEntry
+	if err := c.doAuthed(http.MethodGet, "/api/v1/requests/"+id+"/hours", nil, &out); err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = []TimeEntry{}
+	}
+	return out, nil
+}
+
+func (c *Client) UpdateRequestStatus(id, status string) (*ClientRequest, error) {
+	var out ClientRequest
+	if err := c.doAuthed(http.MethodPatch, "/api/v1/requests/"+id+"/status", map[string]string{"status": status}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) AssignRequest(id, userID string) (*ClientRequest, error) {
+	body := map[string]string{}
+	if userID != "" {
+		body["user_id"] = userID
+	}
+	var out ClientRequest
+	if err := c.doAuthed(http.MethodPost, "/api/v1/requests/"+id+"/assignees", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) UnassignRequest(id, userID string) (*ClientRequest, error) {
+	if userID == "" {
+		userID = "me"
+	}
+	var out ClientRequest
+	if err := c.doAuthed(http.MethodDelete, "/api/v1/requests/"+id+"/assignees/"+userID, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) ListRequestActivity(id string) ([]ActivityEvent, error) {
+	q := url.Values{}
+	q.Set("entity_type", "client_request")
+	q.Set("entity_id", id)
+	var out []ActivityEvent
+	if err := c.doAuthed(http.MethodGet, "/api/v1/activity?"+q.Encode(), nil, &out); err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = []ActivityEvent{}
 	}
 	return out, nil
 }
@@ -316,6 +494,12 @@ func (c *Client) doAuthed(method, path string, body any, out any) error {
 	if !errors.As(err, &ae) || ae.Status != http.StatusUnauthorized {
 		return err
 	}
+	c.mu.Lock()
+	isPAT := c.creds != nil && c.creds.IsPAT()
+	c.mu.Unlock()
+	if isPAT {
+		return ErrUnauthorized
+	}
 	if refreshErr := c.Refresh(); refreshErr != nil {
 		return ErrUnauthorized
 	}
@@ -323,12 +507,14 @@ func (c *Client) doAuthed(method, path string, body any, out any) error {
 }
 
 func (c *Client) do(method, path string, body any, authed bool, out any) error {
+	var bodyBytes []byte
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
 			return err
 		}
+		bodyBytes = b
 		rdr = bytes.NewReader(b)
 	}
 	req, err := http.NewRequest(method, c.BaseURL+path, rdr)
@@ -343,14 +529,25 @@ func (c *Client) do(method, path string, body any, authed bool, out any) error {
 	if authed {
 		c.mu.Lock()
 		tok := ""
+		priv := ""
 		if c.creds != nil {
 			tok = c.creds.AccessToken
+			priv = c.creds.DevicePrivateKey
 		}
 		c.mu.Unlock()
 		if tok == "" {
 			return ErrUnauthorized
 		}
 		req.Header.Set("Authorization", "Bearer "+tok)
+		if priv != "" {
+			// Sign the path the server verifies (URL.Path), never the query string.
+			ts, sig, err := devicekey.Sign(priv, method, req.URL.Path, bodyBytes)
+			if err != nil {
+				return err
+			}
+			req.Header.Set("X-ZT-Timestamp", ts)
+			req.Header.Set("X-ZT-Signature", sig)
+		}
 	}
 	res, err := c.HTTP.Do(req)
 	if err != nil {

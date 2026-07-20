@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -10,12 +11,17 @@ import (
 	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
 
+	"github.com/zulutime-io/cli/internal/api"
+	"github.com/zulutime-io/cli/internal/authlogin"
 	"github.com/zulutime-io/cli/internal/book"
 	"github.com/zulutime-io/cli/internal/cmdutil"
 	"github.com/zulutime-io/cli/internal/config"
+	"github.com/zulutime-io/cli/internal/desk"
+	"github.com/zulutime-io/cli/internal/devicekey"
 	"github.com/zulutime-io/cli/internal/edit"
 	"github.com/zulutime-io/cli/internal/hint"
 	"github.com/zulutime-io/cli/internal/hook"
+	"github.com/zulutime-io/cli/internal/requests"
 	"github.com/zulutime-io/cli/internal/squash"
 	"github.com/zulutime-io/cli/internal/timer"
 	"github.com/zulutime-io/cli/internal/version"
@@ -25,15 +31,18 @@ func main() {
 	root := &cobra.Command{
 		Use:           "ztime",
 		Short:         "ZuluTime CLI — book hours from the terminal",
-		Long:          "Developer CLI for ZuluTime. Login, book hours interactively, with git suggestions from your current repo.",
+		Long:          "Developer CLI for ZuluTime. Login, book hours interactively, with git suggestions from your current repo.\n\nRun `ztime` or `ztime desk` for your personal workspace (Assigned, Timer, Recent, Requests).",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		RunE:          runDesk,
 	}
 
 	root.AddCommand(
 		loginCmd(), logoutCmd(), whoamiCmd(),
 		bookCmd(), editCmd(), amendCmd(), squashCmd(),
 		statusCmd(), submitCmd(),
+		deskCmd(),
+		requestsCmd(),
 		timerCmd(),
 		hintCmd(), hookCmd(),
 		versionCmd(),
@@ -48,7 +57,8 @@ func main() {
 func loginCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "login",
-		Short: "Log in to ZuluTime",
+		Short: "Log in to ZuluTime via browser",
+		Long:  "Opens a browser to authorize the CLI. A personal access token is stored locally after approval.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := cmdutil.LoadConfig()
 			if err != nil {
@@ -59,31 +69,60 @@ func loginCmd() *cobra.Command {
 				return err
 			}
 
-			var email, password string
-			form := huh.NewForm(huh.NewGroup(
-				huh.NewInput().Title("Email").Value(&email).Validate(func(s string) error {
-					if strings.TrimSpace(s) == "" {
-						return errors.New("email required")
-					}
-					return nil
-				}),
-				huh.NewInput().Title("Password").EchoMode(huh.EchoModePassword).Value(&password).Validate(func(s string) error {
-					if s == "" {
-						return errors.New("password required")
-					}
-					return nil
-				}),
-			))
-			if err := form.Run(); err != nil {
+			pkce, err := authlogin.NewPKCE()
+			if err != nil {
+				return err
+			}
+			keys, err := devicekey.Generate()
+			if err != nil {
+				return err
+			}
+			cb, err := authlogin.StartCallbackServer(pkce.State)
+			if err != nil {
 				return err
 			}
 
-			if _, err := client.Login(strings.TrimSpace(email), password); err != nil {
+			start, err := client.StartCLILogin(map[string]any{
+				"redirect_uri":        cb.RedirectURI,
+				"state":               pkce.State,
+				"code_challenge":      pkce.Challenge,
+				"user_code_challenge": authlogin.UserCodeChallenge(pkce.UserCode),
+				"device_name":         authlogin.DefaultDeviceName(),
+				"device_public_key":   keys.PublicKeyB64,
+				"key_alg":             keys.Alg,
+			})
+			if err != nil {
 				return err
 			}
+
+			authURL := authlogin.AuthorizeURL(cfg.WebOrigin(), start.LoginID)
+			fmt.Println("Opening browser to authorize ZuluTime CLI…")
+			fmt.Printf("\n  Confirmation code: %s\n\n", pkce.UserCode)
+			fmt.Println("Enter this code in the browser, then grant access.")
+			fmt.Println(authURL)
+			if err := authlogin.OpenBrowser(authURL); err != nil {
+				fmt.Fprintf(os.Stderr, "Could not open browser automatically: %v\nOpen the URL above manually.\n", err)
+			}
+
+			ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Minute)
+			defer cancel()
+			res, err := cb.Wait(ctx)
+			if err != nil {
+				return err
+			}
+			if _, err := client.ExchangeCLICode(res.Code, pkce.Verifier, cb.RedirectURI, keys.PrivateKeyB64, keys.Alg); err != nil {
+				return err
+			}
+
+			// Persist effective API/web URLs so later commands without env vars hit the same host.
+			if err := cfg.Save(); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not save API URL to config: %v\n", err)
+			}
+
 			me, err := client.Me()
 			if err != nil {
 				fmt.Println("✓ Logged in")
+				fmt.Printf("  API: %s\n", cfg.APIURL)
 				return nil
 			}
 			fmt.Printf("✓ Logged in as %s (%s) — %s\n", me.User.Name, me.User.Email, me.Organization.Name)
@@ -157,7 +196,7 @@ func bookCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "book",
 		Short: "Book hours (interactive)",
-		Long:  "Wizard: client → project → date/hours/description. Suggestions from git commits in the current directory.",
+		Long:  "Wizard: client → project → date/hours/description. Suggestions from git commits in the current directory.\n\nWith --project alone, the client is derived from the project (no client prompt).",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := cmdutil.LoadConfig()
 			if err != nil {
@@ -182,11 +221,11 @@ func bookCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&clientID, "client", "", "Client ID (skip selection)")
-	cmd.Flags().StringVar(&projectID, "project", "", "Project ID (skip selection)")
+	cmd.Flags().StringVar(&projectID, "project", "", "Project ID (skip selection; also derives client)")
 	cmd.Flags().Float64Var(&hours, "hours", 0, "Hours")
 	cmd.Flags().StringVar(&date, "date", "", "Date YYYY-MM-DD")
 	cmd.Flags().StringVar(&desc, "desc", "", "Description")
-	cmd.Flags().BoolVar(&submit, "submit", false, "Submit immediately after saving")
+	cmd.Flags().BoolVar(&submit, "submit", false, "Default submit confirm to Yes (still asks)")
 	cmd.Flags().BoolVar(&noGit, "no-git", false, "Skip git suggestions")
 	return cmd
 }
@@ -314,6 +353,19 @@ func submitCmd() *cobra.Command {
 			if to == "" {
 				to = today
 			}
+			ok := false
+			if err := huh.NewForm(huh.NewGroup(
+				huh.NewConfirm().
+					Title(fmt.Sprintf("Submit all draft/rejected hours (%s → %s)?", from, to)).
+					Affirmative("Submit").
+					Negative("Cancel").
+					Value(&ok),
+			)).Run(); err != nil {
+				return err
+			}
+			if !ok {
+				return nil
+			}
 			n, err := client.SubmitBatch(from, to)
 			if err != nil {
 				return err
@@ -349,6 +401,184 @@ func squashCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "Allow different projects (keep target)")
+	return cmd
+}
+
+func runDesk(cmd *cobra.Command, args []string) error {
+	cfg, err := cmdutil.LoadConfig()
+	if err != nil {
+		return err
+	}
+	client, err := cmdutil.NewAPI(cfg)
+	if err != nil {
+		return err
+	}
+	if err := cmdutil.RequireAuth(client); err != nil {
+		return err
+	}
+	return desk.Run(client, cfg)
+}
+
+func deskCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:     "desk",
+		Aliases: []string{"home", "today"},
+		Short:   "Personal workspace — assigned, timer, recent, requests",
+		Long:    "Interactive desk with 4 panels: Assigned (yours), Timer, Recent entries, Requests (org inbox).\n\nKeys: ←/→ panels, enter request detail, b book hours (on a request when selected), a assign, t timer, s submit, e edit, q quit.\nRequests require Team.",
+		RunE:    runDesk,
+	}
+}
+
+func requestsCmd() *cobra.Command {
+	var clientID, status string
+	cmd := &cobra.Command{
+		Use:   "requests",
+		Short: "Browse client requests interactively",
+		Long:  "Interactively browse verzoeken with preview + hours/status history. Use list/show for non-interactive output.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := cmdutil.LoadConfig()
+			if err != nil {
+				return err
+			}
+			client, err := cmdutil.NewAPI(cfg)
+			if err != nil {
+				return err
+			}
+			if err := cmdutil.RequireAuth(client); err != nil {
+				return err
+			}
+			return requests.Run(client, cfg, requests.Options{ClientID: clientID, Status: status})
+		},
+	}
+	cmd.Flags().StringVar(&clientID, "client", "", "Filter by client ID")
+	cmd.Flags().StringVar(&status, "status", "", "Filter: open|in_progress|active|done|cancelled|all")
+
+	list := &cobra.Command{
+		Use:   "list",
+		Short: "List requests (non-interactive)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := cmdutil.LoadConfig()
+			if err != nil {
+				return err
+			}
+			client, err := cmdutil.NewAPI(cfg)
+			if err != nil {
+				return err
+			}
+			if err := cmdutil.RequireAuth(client); err != nil {
+				return err
+			}
+			if err := requireClientRequests(client); err != nil {
+				return err
+			}
+			apiStatus := status
+			if apiStatus == "all" || apiStatus == "active" {
+				apiStatus = ""
+			}
+			list, err := client.ListRequests(clientID, apiStatus)
+			if err != nil {
+				return err
+			}
+			if status == "active" {
+				filtered := list[:0]
+				for _, r := range list {
+					if r.Status == "open" || r.Status == "in_progress" {
+						filtered = append(filtered, r)
+					}
+				}
+				list = filtered
+			}
+			if len(list) == 0 {
+				fmt.Println("No requests")
+				return nil
+			}
+			for _, r := range list {
+				hours := float64(r.MinutesLogged) / 60
+				proj := r.ProjectName
+				if proj == "" {
+					proj = "-"
+				}
+				ref := r.Ref
+				if ref == "" {
+					ref = r.ID
+				}
+				fmt.Printf("%-8s  %-12s  %-18s  %-20s  %5.1fh  %s\n",
+					ref,
+					r.Status,
+					trunc(r.ClientName, 18),
+					trunc(proj, 20),
+					hours,
+					r.Title,
+				)
+			}
+			return nil
+		},
+	}
+	list.Flags().StringVar(&clientID, "client", "", "Filter by client ID")
+	list.Flags().StringVar(&status, "status", "", "Filter by status")
+
+	show := &cobra.Command{
+		Use:   "show <ref>",
+		Short: "Show one request (non-interactive)",
+		Long:  "Accepts short ref (V-42) or UUID.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := cmdutil.LoadConfig()
+			if err != nil {
+				return err
+			}
+			client, err := cmdutil.NewAPI(cfg)
+			if err != nil {
+				return err
+			}
+			if err := cmdutil.RequireAuth(client); err != nil {
+				return err
+			}
+			if err := requireClientRequests(client); err != nil {
+				return err
+			}
+			r, err := client.GetRequest(args[0])
+			if err != nil {
+				return err
+			}
+			if r.Ref != "" {
+				fmt.Printf("Ref:      %s\n", r.Ref)
+			}
+			fmt.Printf("Status:   %s\n", r.Status)
+			fmt.Printf("Client:   %s\n", r.ClientName)
+			if r.ProjectName != "" {
+				fmt.Printf("Project:  %s\n", r.ProjectName)
+			}
+			if r.TypeName != "" {
+				fmt.Printf("Type:     %s\n", r.TypeName)
+			}
+			fmt.Printf("Title:    %s\n", r.Title)
+			if r.Description != "" {
+				fmt.Printf("Desc:     %s\n", r.Description)
+			}
+			if r.CreatedByName != "" {
+				fmt.Printf("Created:  %s (%s)\n", r.CreatedByName, r.CreatedAt)
+			} else {
+				fmt.Printf("Created:  %s\n", r.CreatedAt)
+			}
+			fmt.Printf("Logged:   %.1fh\n", float64(r.MinutesLogged)/60)
+			hours, err := client.ListRequestHours(args[0])
+			if err == nil && len(hours) > 0 {
+				fmt.Println("\nHours:")
+				for _, e := range hours {
+					who := e.UserName
+					if who == "" {
+						who = "-"
+					}
+					fmt.Printf("  %s  %5.1fh  %-12s  %s · %s\n",
+						e.EntryDate, float64(e.DurationMinutes)/60, e.Status, who, e.Description)
+				}
+			}
+			return nil
+		},
+	}
+
+	cmd.AddCommand(list, show)
 	return cmd
 }
 
@@ -471,6 +701,17 @@ func versionCmd() *cobra.Command {
 			fmt.Println(version.Version)
 		},
 	}
+}
+
+func requireClientRequests(client *api.Client) error {
+	me, err := client.Me()
+	if err != nil {
+		return err
+	}
+	if !me.HasClientRequests() {
+		return errors.New(api.MsgRequestsLocked)
+	}
+	return nil
 }
 
 func trunc(s string, n int) string {

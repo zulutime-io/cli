@@ -5,6 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"github.com/zulutime-io/cli/internal/keyringstore"
 )
 
 const (
@@ -16,14 +19,29 @@ const (
 )
 
 type Config struct {
-	APIURL           string            `json:"api_url"`
-	ProjectByRemote  map[string]string `json:"project_by_remote,omitempty"` // remote URL -> project_id
-	LastClientID     string            `json:"last_client_id,omitempty"`
+	APIURL          string            `json:"api_url"`
+	WebURL          string            `json:"web_url,omitempty"` // browser origin for login; defaults to APIURL
+	ProjectByRemote map[string]string `json:"project_by_remote,omitempty"` // remote URL -> project_id
+	LastClientID    string            `json:"last_client_id,omitempty"`
 }
 
 type Credentials struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
+	AccessToken      string `json:"access_token"`
+	RefreshToken     string `json:"refresh_token,omitempty"`
+	TokenType        string `json:"token_type,omitempty"` // "pat" or empty/session
+	DeviceID         string `json:"device_id,omitempty"`
+	DevicePrivateKey string `json:"device_private_key,omitempty"` // legacy file storage; migrated to OS keychain
+	DeviceKeyAlg     string `json:"device_key_alg,omitempty"`
+}
+
+func (c *Credentials) IsPAT() bool {
+	if c == nil {
+		return false
+	}
+	if c.TokenType == "pat" {
+		return true
+	}
+	return len(c.AccessToken) >= 6 && c.AccessToken[:6] == "ztpat_"
 }
 
 func Dir() (string, error) {
@@ -58,9 +76,13 @@ func Load() (*Config, error) {
 	if env := os.Getenv("ZTIME_API_URL"); env != "" {
 		cfg.APIURL = env
 	}
+	if env := os.Getenv("ZTIME_WEB_URL"); env != "" {
+		cfg.WebURL = env
+	}
 	data, err := os.ReadFile(p)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			cfg.applyEnvOverrides()
 			return cfg, nil
 		}
 		return nil, err
@@ -71,13 +93,28 @@ func Load() (*Config, error) {
 	if cfg.APIURL == "" {
 		cfg.APIURL = DefaultAPIURL
 	}
-	if env := os.Getenv("ZTIME_API_URL"); env != "" {
-		cfg.APIURL = env
-	}
+	cfg.applyEnvOverrides()
 	if cfg.ProjectByRemote == nil {
 		cfg.ProjectByRemote = map[string]string{}
 	}
 	return cfg, nil
+}
+
+func (c *Config) applyEnvOverrides() {
+	if env := os.Getenv("ZTIME_API_URL"); env != "" {
+		c.APIURL = env
+	}
+	if env := os.Getenv("ZTIME_WEB_URL"); env != "" {
+		c.WebURL = env
+	}
+}
+
+// WebOrigin returns the browser origin for CLI authorize (web_url, else api_url).
+func (c *Config) WebOrigin() string {
+	if c.WebURL != "" {
+		return strings.TrimRight(c.WebURL, "/")
+	}
+	return strings.TrimRight(c.APIURL, "/")
 }
 
 func (c *Config) Save() error {
@@ -93,6 +130,9 @@ func (c *Config) Save() error {
 }
 
 func LoadCredentials() (*Credentials, error) {
+	if env := strings.TrimSpace(os.Getenv("ZTIME_TOKEN")); env != "" {
+		return &Credentials{AccessToken: env, TokenType: "pat"}, nil
+	}
 	p, err := path(credFileName)
 	if err != nil {
 		return nil, err
@@ -108,15 +148,42 @@ func LoadCredentials() (*Credentials, error) {
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, err
 	}
+
+	// Migrate legacy on-disk private key into the OS keychain.
+	if c.DevicePrivateKey != "" && c.DeviceID != "" {
+		if err := keyringstore.SetDevicePrivateKey(c.DeviceID, c.DevicePrivateKey); err == nil {
+			c.DevicePrivateKey = ""
+			_ = SaveCredentials(&c)
+		}
+	}
+
+	if c.DevicePrivateKey == "" && c.DeviceID != "" {
+		if secret, err := keyringstore.GetDevicePrivateKey(c.DeviceID); err == nil {
+			c.DevicePrivateKey = secret
+		} else if !keyringstore.IsNotFound(err) {
+			return nil, err
+		}
+	}
 	return &c, nil
 }
 
 func SaveCredentials(c *Credentials) error {
+	if c == nil {
+		return ClearCredentials()
+	}
+	toStore := *c
+	if toStore.DevicePrivateKey != "" && toStore.DeviceID != "" {
+		if err := keyringstore.SetDevicePrivateKey(toStore.DeviceID, toStore.DevicePrivateKey); err != nil {
+			return err
+		}
+		// Never persist the private key on disk.
+		toStore.DevicePrivateKey = ""
+	}
 	p, err := path(credFileName)
 	if err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(c, "", "  ")
+	data, err := json.MarshalIndent(toStore, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -128,11 +195,17 @@ func ClearCredentials() error {
 	if err != nil {
 		return err
 	}
-	err = os.Remove(p)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+	if data, err := os.ReadFile(p); err == nil {
+		var c Credentials
+		if json.Unmarshal(data, &c) == nil && c.DeviceID != "" {
+			_ = keyringstore.DeleteDevicePrivateKey(c.DeviceID)
+		}
 	}
-	return err
+	_ = keyringstore.DeleteDevicePrivateKey("")
+	if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func (c *Config) RememberProject(remote, projectID, clientID string) {

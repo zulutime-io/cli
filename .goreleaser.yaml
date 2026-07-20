@@ -23,7 +23,8 @@ builds:
       - -s -w -X github.com/zulutime-io/cli/internal/version.Version={{.Version}}
 
 archives:
-  - formats: [tar.gz]
+  # `format` (singular) for GoReleaser < v2.6; still accepted on newer releases.
+  - format: tar.gz
     name_template: >-
       {{ .ProjectName }}_
       {{- .Version }}_

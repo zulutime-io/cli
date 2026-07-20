@@ -14,9 +14,10 @@ import (
 )
 
 type Options struct {
-	Hours float64
-	Desc  string
-	NoGit bool
+	EntryID string // when set, edit this entry (no picker)
+	Hours   float64
+	Desc    string
+	NoGit   bool
 }
 
 func latestInRange(client *api.Client, days int) ([]api.TimeEntry, error) {
@@ -70,9 +71,25 @@ func RunEdit(client *api.Client, o Options) error {
 	if err != nil {
 		return err
 	}
-	entry, err := pickEntry(list, map[string]bool{"draft": true, "rejected": true})
-	if err != nil {
-		return fmt.Errorf("%w (only draft/rejected are fully editable — use `ztime amend` for commits)", err)
+	var entry *api.TimeEntry
+	if o.EntryID != "" {
+		for i := range list {
+			if list[i].ID == o.EntryID {
+				entry = &list[i]
+				break
+			}
+		}
+		if entry == nil {
+			return errors.New("entry not found")
+		}
+		if entry.Status != "draft" && entry.Status != "rejected" {
+			return fmt.Errorf("only draft/rejected can be edited (got %s — use `ztime amend` for commits)", entry.Status)
+		}
+	} else {
+		entry, err = pickEntry(list, map[string]bool{"draft": true, "rejected": true})
+		if err != nil {
+			return fmt.Errorf("%w (only draft/rejected are fully editable — use `ztime amend` for commits)", err)
+		}
 	}
 
 	fmt.Printf("Editing: %s · %s · %.1fh · %s\n", entry.EntryDate, entry.ProjectName, float64(entry.DurationMinutes)/60, entry.Status)

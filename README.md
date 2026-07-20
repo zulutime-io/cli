@@ -27,13 +27,15 @@ Download an archive from [Releases](https://github.com/zulutime-io/cli/releases)
 ## Quick start
 
 ```bash
-ztime login
+ztime login     # opens browser → grant access → token stored locally
 ztime whoami
 ztime book      # interactive: client → project → hours (+ git commits)
 ztime submit    # submit today's drafts
 ```
 
-Default API origin: `https://zulutime.io` (paths use `/api/v1/...`). Override with `ZTIME_API_URL` or `api_url` in config.
+`ztime login` starts a localhost callback, opens the web authorize page (with a 6-digit confirmation code), and stores a **device-bound** personal access token after you approve. The access token lives in `credentials.json`; the device private key is kept in the OS keychain (macOS Keychain / libsecret / Windows Credential Manager). Copying only the token to another machine will not work. Revoke devices/tokens under **Account** in the web app. Tokens expire after at most **1 year**.
+
+Default API origin: `https://zulutime.io` (paths use `/api/v1/...`). Override with `ZTIME_API_URL` or `api_url` in config. Browser origin for login defaults to the same host; override with `ZTIME_WEB_URL` or `web_url`. For CI/scripts you can set `ZTIME_TOKEN` to a PAT from Account.
 
 ## Commands
 
@@ -116,8 +118,8 @@ shell = ["sh"]
 
 | File | Purpose |
 |------|---------|
-| `config.json` | `api_url`, remembered projects |
-| `credentials.json` | tokens (mode `0600`) |
+| `config.json` | `api_url`, optional `web_url`, remembered projects |
+| `credentials.json` | PAT (mode `0600`) |
 | `timer.json` | local timer state |
 
 ## License

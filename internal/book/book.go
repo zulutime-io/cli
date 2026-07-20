@@ -17,10 +17,11 @@ import (
 type Options struct {
 	ClientID  string
 	ProjectID string
+	RequestID string
 	Hours     float64
 	Date      string
 	Desc      string
-	Submit    bool // --submit: skip ask and submit
+	Submit    bool // --submit: default submit confirm to Yes (still asks)
 	NoGit     bool
 }
 
@@ -101,7 +102,23 @@ func Run(client *api.Client, cfg *config.Config, o Options) error {
 		}
 	}
 
-	if o.ClientID == "" {
+	// --project alone: derive client and skip client prompt.
+	derivedFromProject := false
+	if o.ClientID == "" && o.ProjectID != "" {
+		for _, p := range activeProjects {
+			if p.ID == o.ProjectID {
+				clientID = p.ClientID
+				projectID = p.ID
+				derivedFromProject = true
+				break
+			}
+		}
+		if !derivedFromProject {
+			return fmt.Errorf("project not found or inactive")
+		}
+	}
+
+	if o.ClientID == "" && !derivedFromProject {
 		choices := make([]huh.Option[string], 0, len(active))
 		for _, c := range active {
 			choices = append(choices, huh.NewOption(c.Name, c.ID))
@@ -121,7 +138,7 @@ func Run(client *api.Client, cfg *config.Config, o Options) error {
 	if projectID != "" && !projectIn(clientProjects, projectID) {
 		projectID = ""
 	}
-	if o.ProjectID == "" {
+	if projectID == "" {
 		choices := make([]huh.Option[string], 0, len(clientProjects))
 		for _, p := range clientProjects {
 			label := p.Name
@@ -135,8 +152,6 @@ func Run(client *api.Client, cfg *config.Config, o Options) error {
 		)).Run(); err != nil {
 			return err
 		}
-	} else if !projectIn(clientProjects, projectID) {
-		return fmt.Errorf("project does not belong to selected client")
 	}
 
 	var project api.Project
@@ -188,12 +203,39 @@ func Run(client *api.Client, cfg *config.Config, o Options) error {
 	}
 
 	desc := o.Desc
+	if err := huh.NewForm(huh.NewGroup(
+		huh.NewInput().
+			Title("Description").
+			Description("Review and edit if needed").
+			Value(&desc).
+			Validate(func(s string) error {
+				if strings.TrimSpace(s) == "" {
+					return errors.New("description required")
+				}
+				return nil
+			}),
+	)).Run(); err != nil {
+		return err
+	}
+	desc = strings.TrimSpace(desc)
+
 	var selectedRefs api.CommitList
-	if desc == "" {
-		if len(gitCommits) > 0 {
+	if !o.NoGit && len(gitCommits) > 0 {
+		addGit := false
+		if err := huh.NewForm(huh.NewGroup(
+			huh.NewConfirm().
+				Title("Add git commits?").
+				Description(fmt.Sprintf("%d unbooked commit(s) in this repo", len(gitCommits))).
+				Affirmative("Yes").
+				Negative("No").
+				Value(&addGit),
+		)).Run(); err != nil {
+			return err
+		}
+		if addGit {
 			byKey := map[string]gitx.Commit{}
 			choices := make([]huh.Option[string], 0, len(gitCommits))
-			selectedKeys := make([]string, 0, len(gitCommits))
+			selectedKeys := make([]string, 0)
 			for _, c := range gitCommits {
 				key := c.SHA
 				if key == "" {
@@ -205,11 +247,10 @@ func Run(client *api.Client, cfg *config.Config, o Options) error {
 					label = c.SHA + " " + c.Subject
 				}
 				choices = append(choices, huh.NewOption(label, key))
-				selectedKeys = append(selectedKeys, key) // default: all unbooked
 			}
 			if err := huh.NewForm(huh.NewGroup(
 				huh.NewMultiSelect[string]().
-					Title("Include commits (not yet booked)").
+					Title("Commits to attach").
 					Options(choices...).
 					Value(&selectedKeys),
 			)).Run(); err != nil {
@@ -220,12 +261,26 @@ func Run(client *api.Client, cfg *config.Config, o Options) error {
 					selectedRefs = append(selectedRefs, api.CommitRef{SHA: c.SHA, Subject: c.Subject})
 				}
 			}
-			desc = selectedRefs.JoinSubjects("; ")
-		}
-		if err := huh.NewForm(huh.NewGroup(
-			huh.NewInput().Title("Description").Value(&desc),
-		)).Run(); err != nil {
-			return err
+			if len(selectedRefs) > 0 {
+				appendDesc := false
+				if err := huh.NewForm(huh.NewGroup(
+					huh.NewConfirm().
+						Title("Append commit subjects to description?").
+						Affirmative("Yes").
+						Negative("No — keep description").
+						Value(&appendDesc),
+				)).Run(); err != nil {
+					return err
+				}
+				if appendDesc {
+					extra := selectedRefs.JoinSubjects("; ")
+					if desc == "" {
+						desc = extra
+					} else {
+						desc = desc + " · " + extra
+					}
+				}
+			}
 		}
 	}
 
@@ -255,6 +310,7 @@ func Run(client *api.Client, cfg *config.Config, o Options) error {
 
 	entry, err := client.CreateTimeEntry(api.CreateTimeEntryInput{
 		ProjectID:     projectID,
+		RequestID:     o.RequestID,
 		EntryDate:     date,
 		DurationHours: hours,
 		Description:   desc,
@@ -271,22 +327,19 @@ func Run(client *api.Client, cfg *config.Config, o Options) error {
 
 	fmt.Printf("✓ Draft saved: %s · %s · %.2fh\n", entry.ClientName, entry.ProjectName, float64(entry.DurationMinutes)/60)
 
-	doSubmit := o.Submit
-	if !o.Submit {
-		ask := true
-		if err := huh.NewForm(huh.NewGroup(
-			huh.NewConfirm().
-				Title("Submit for approval?").
-				Affirmative("Submit").
-				Negative("Later").
-				Value(&ask),
-		)).Run(); err != nil {
-			return err
-		}
-		doSubmit = ask
+	ask := o.Submit // --submit defaults the confirm to Yes, but still asks
+	fmt.Println()
+	if err := huh.NewForm(huh.NewGroup(
+		huh.NewConfirm().
+			Title("Submit for approval?").
+			Affirmative("Submit").
+			Negative("Keep as draft").
+			Value(&ask),
+	)).Run(); err != nil {
+		return err
 	}
 
-	if doSubmit {
+	if ask {
 		updated, err := client.SubmitTimeEntry(entry.ID)
 		if err != nil {
 			return fmt.Errorf("saved, but submit failed: %w", err)
