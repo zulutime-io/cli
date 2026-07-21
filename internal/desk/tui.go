@@ -342,18 +342,23 @@ func (m model) View() string {
 	b.WriteString(titleStyle.Render("ztime desk"))
 	b.WriteString(mutedStyle.Render("  ·  personal workspace"))
 	b.WriteString("\n\n")
-	b.WriteString(m.renderTabs())
-	b.WriteString("\n\n")
 
-	switch m.focus {
-	case panelAssigned:
-		b.WriteString(m.renderAssigned(w))
-	case panelTimer:
-		b.WriteString(m.renderTimer(w))
-	case panelEntries:
-		b.WriteString(m.renderEntries(w))
-	case panelRequests:
-		b.WriteString(m.renderRequests(w))
+	// Wide terminals: 2×2 dashboard. Narrow: one focused panel (tabs).
+	if w >= 76 {
+		b.WriteString(m.renderDashboard(w))
+	} else {
+		b.WriteString(m.renderTabs())
+		b.WriteString("\n\n")
+		switch m.focus {
+		case panelAssigned:
+			b.WriteString(m.renderAssigned(w))
+		case panelTimer:
+			b.WriteString(m.renderTimer(w))
+		case panelEntries:
+			b.WriteString(m.renderEntries(w))
+		case panelRequests:
+			b.WriteString(m.renderRequests(w))
+		}
 	}
 
 	b.WriteString("\n")
@@ -361,6 +366,158 @@ func (m model) View() string {
 		b.WriteString(warnStyle.Render(m.status) + "\n")
 	}
 	b.WriteString(helpStyle.Render(m.helpLine()))
+	return b.String()
+}
+
+func (m model) renderDashboard(w int) string {
+	gap := 1
+	colW := (w - gap) / 2
+	if colW < 34 {
+		colW = 34
+	}
+	innerW := colW - 4
+	if innerW < 24 {
+		innerW = 24
+	}
+	bodyLines := 8
+	if m.height >= 28 {
+		bodyLines = 10
+	}
+	if m.height >= 36 {
+		bodyLines = 12
+	}
+
+	assignedTitle := fmt.Sprintf("Assigned (%d)", len(m.data.Assigned))
+	if !m.data.CanRequests {
+		assignedTitle = "Assigned (Team)"
+	}
+	requestsTitle := fmt.Sprintf("Requests (%d)", len(m.data.Requests))
+	if !m.data.CanRequests {
+		requestsTitle = "Requests (Team)"
+	}
+
+	top := lipgloss.JoinHorizontal(lipgloss.Top,
+		m.framePanel(panelAssigned, assignedTitle, m.compactAssigned(innerW, bodyLines), colW, bodyLines+2),
+		strings.Repeat(" ", gap),
+		m.framePanel(panelTimer, "Timer", m.compactTimer(innerW, bodyLines), colW, bodyLines+2),
+	)
+	bottom := lipgloss.JoinHorizontal(lipgloss.Top,
+		m.framePanel(panelEntries, fmt.Sprintf("Recent (%d)", len(m.data.Entries)), m.compactEntries(innerW, bodyLines), colW, bodyLines+2),
+		strings.Repeat(" ", gap),
+		m.framePanel(panelRequests, requestsTitle, m.compactRequests(innerW, bodyLines), colW, bodyLines+2),
+	)
+	return lipgloss.JoinVertical(lipgloss.Left, top, bottom)
+}
+
+func (m model) framePanel(p panel, title, body string, width, height int) string {
+	border := lipgloss.Color("240")
+	titleStyleLocal := lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Bold(true)
+	if p == m.focus {
+		border = lipgloss.Color("81")
+		titleStyleLocal = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Bold(true).Background(lipgloss.Color("57")).Padding(0, 1)
+	}
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(border).
+		Width(width - 2).
+		Height(height).
+		Padding(0, 1)
+	header := titleStyleLocal.Render(title)
+	inner := strings.TrimRight(body, "\n")
+	return box.Render(header + "\n" + inner)
+}
+
+func (m model) compactAssigned(w, maxLines int) string {
+	if !m.data.CanRequests {
+		return mutedStyle.Render("Team plan required")
+	}
+	if len(m.data.Assigned) == 0 {
+		return mutedStyle.Render("Nothing assigned.\nOpen Requests · a to assign")
+	}
+	return m.compactRequestList(w, maxLines, m.data.Assigned, m.assignedIdx, m.focus == panelAssigned)
+}
+
+func (m model) compactRequests(w, maxLines int) string {
+	if !m.data.CanRequests {
+		return mutedStyle.Render("Team plan required")
+	}
+	if len(m.data.Requests) == 0 {
+		return mutedStyle.Render("No open requests")
+	}
+	return m.compactRequestList(w, maxLines, m.data.Requests, m.requestIdx, m.focus == panelRequests)
+}
+
+func (m model) compactRequestList(w, maxLines int, list []api.ClientRequest, idx int, showSel bool) string {
+	var b strings.Builder
+	limit := min(len(list), maxLines)
+	start := 0
+	if showSel && idx >= limit {
+		start = idx - limit + 1
+	}
+	end := min(len(list), start+limit)
+	for i := start; i < end; i++ {
+		r := list[i]
+		ref := r.Ref
+		if ref == "" {
+			ref = trunc(r.ID, 6)
+		}
+		mine := ""
+		if isAssigned(r, m.myID) {
+			mine = "★ "
+		}
+		line := trunc(fmt.Sprintf("%s%s · %s", mine, ref, r.Title), w)
+		if showSel && i == idx {
+			b.WriteString(selStyle.Render("› "+line) + "\n")
+		} else {
+			b.WriteString(rowStyle.Render("  "+line) + "\n")
+		}
+	}
+	if len(list) > end {
+		b.WriteString(mutedStyle.Render(fmt.Sprintf("  … +%d more", len(list)-end)) + "\n")
+	}
+	return b.String()
+}
+
+func (m model) compactTimer(w, maxLines int) string {
+	_ = maxLines
+	s := m.data.Timer
+	if s == nil {
+		return mutedStyle.Render("Stopped\nenter/t to start")
+	}
+	label := s.Label
+	if label == "" {
+		label = "work"
+	}
+	var b strings.Builder
+	b.WriteString(timerStyle.Render("⏱  "+timer.FormatElapsed(s.Elapsed())) + "\n")
+	b.WriteString(titleStyle.Render(trunc(label, w)) + "\n")
+	b.WriteString(mutedStyle.Render(fmt.Sprintf("~%.2fh · enter stop&book", timer.HoursRounded(s.Elapsed()))) + "\n")
+	return b.String()
+}
+
+func (m model) compactEntries(w, maxLines int) string {
+	if len(m.data.Entries) == 0 {
+		return mutedStyle.Render("No recent drafts")
+	}
+	var b strings.Builder
+	limit := min(len(m.data.Entries), maxLines)
+	start := 0
+	if m.focus == panelEntries && m.entryIdx >= limit {
+		start = m.entryIdx - limit + 1
+	}
+	end := min(len(m.data.Entries), start+limit)
+	for i := start; i < end; i++ {
+		e := m.data.Entries[i]
+		line := trunc(fmt.Sprintf("%.1fh %s · %s", float64(e.DurationMinutes)/60, e.Status, e.Description), w)
+		if e.Description == "" {
+			line = trunc(fmt.Sprintf("%.1fh %s · %s", float64(e.DurationMinutes)/60, e.Status, e.ProjectName), w)
+		}
+		if m.focus == panelEntries && i == m.entryIdx {
+			b.WriteString(selStyle.Render("› "+line) + "\n")
+		} else {
+			b.WriteString(rowStyle.Render("  "+line) + "\n")
+		}
+	}
 	return b.String()
 }
 

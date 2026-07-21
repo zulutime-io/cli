@@ -424,7 +424,7 @@ func deskCmd() *cobra.Command {
 		Use:     "desk",
 		Aliases: []string{"home", "today"},
 		Short:   "Personal workspace — assigned, timer, recent, requests",
-		Long:    "Interactive desk with 4 panels: Assigned (yours), Timer, Recent entries, Requests (org inbox).\n\nKeys: ←/→ panels, enter request detail, b book hours (on a request when selected), a assign, t timer, s submit, e edit, q quit.\nRequests require Team.",
+		Long:    "Interactive desk as a 2×2 dashboard: Assigned (yours), Timer, Recent entries, Requests (org inbox). Narrow terminals fall back to one panel at a time.\n\nKeys: ←/→ focus panel, ↑/↓ select, enter request detail, b book hours, a assign, t timer, s submit, e edit, q quit.\nRequests require Team.",
 		RunE:    runDesk,
 	}
 }
